@@ -163,7 +163,13 @@ def parse_patent_html(requested_number: str, used_number: str, page_html: str, d
     """Parse structured metadata from a Google Patents HTML page."""
     from bs4 import BeautifulSoup
 
-    soup = BeautifulSoup(page_html, "html.parser")
+    try:
+        import lxml  # noqa: F401
+
+        parser = "lxml"
+    except ImportError:
+        parser = "html.parser"
+    soup = BeautifulSoup(page_html, parser)
     groups = set(detail_groups or set()) & DETAIL_GROUPS
     meta = lambda name, scheme=None: _all(  # noqa: E731
         soup,
@@ -261,11 +267,23 @@ def generate_alternate_document_numbers(document_number: str) -> list[str]:
 
 def _session():
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
     session = getattr(_thread_local, "session", None)
     if session is None:
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; CorporateTools/1.0)"})
+        retry = Retry(
+            total=2,
+            backoff_factor=0.8,
+            status_forcelist=sorted(RETRY_STATUSES),
+            allowed_methods={"GET"},
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
         _thread_local.session = session
     return session
 

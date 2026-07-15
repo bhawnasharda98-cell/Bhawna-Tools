@@ -910,9 +910,11 @@ def research_tool(name: str) -> None:
                         json.dumps(result, indent=2),
                         "patent_intelligence_partial.json",
                         "application/json",
-                    )
+                )
                 time.sleep(1)
                 st.rerun()
+            render_patent_results(result)
+            return
             patents = result["patents"]
             summary_records = []
             for patent in patents:
