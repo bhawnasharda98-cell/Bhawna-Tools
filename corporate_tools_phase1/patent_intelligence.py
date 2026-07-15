@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import re
-from threading import Lock
+import time
+from threading import Event, Lock, local
 
 BASE_URL = "https://patents.google.com/patent/{}/en"
-MAX_WORKERS = 6
+MAX_WORKERS = 12
+DEFAULT_WORKERS = 4
+DEFAULT_BATCH_SIZE = 100
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 DETAIL_GROUPS = {
     "translations",
     "legal",
@@ -20,6 +25,10 @@ DETAIL_GROUPS = {
 }
 _translation_cache: dict[str, str] = {}
 _cache_lock = Lock()
+_thread_local = local()
+
+
+ProgressCallback = Callable[[int, int, dict], None]
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -250,35 +259,109 @@ def generate_alternate_document_numbers(document_number: str) -> list[str]:
     return alternatives
 
 
-def _fetch_one(document_number: str, session, detail_groups: set[str]) -> dict:
+def _session():
+    import requests
+
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; CorporateTools/1.0)"})
+        _thread_local.session = session
+    return session
+
+
+def _is_not_found(response) -> bool:
+    return response.status_code == 404 or "Error 404" in response.text
+
+
+def _fetch_one(document_number: str, detail_groups: set[str], retry_count: int = 2) -> dict:
     requested = document_number.strip().upper().replace(" ", "")
+    session = _session()
+    last_error = ""
     for candidate in [requested, *generate_alternate_document_numbers(requested)]:
-        try:
-            response = session.get(BASE_URL.format(candidate), timeout=25)
-            response.encoding = "utf-8"
-            if response.ok and "Error 404" not in response.text:
-                return parse_patent_html(requested, candidate, response.text, detail_groups)
-        except Exception:
-            continue
+        for attempt in range(retry_count + 1):
+            try:
+                response = session.get(BASE_URL.format(candidate), timeout=25)
+                response.encoding = "utf-8"
+                if response.ok and not _is_not_found(response):
+                    return parse_patent_html(requested, candidate, response.text, detail_groups)
+                if _is_not_found(response):
+                    break
+                last_error = f"HTTP {response.status_code}"
+                if response.status_code in RETRY_STATUSES and attempt < retry_count:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < retry_count:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+                break
+    if last_error:
+        return {"document_number": requested, "document_number_used": "", "availability": "Error", "error": last_error}
     return {"document_number": requested, "document_number_used": "", "availability": "Not Found"}
 
 
-def fetch_patents(document_numbers: list[str], detail_groups: set[str] | None = None) -> dict:
-    """Fetch patent records concurrently while preserving the requested order."""
-    import requests
+def _chunks(values: list[str], size: int) -> list[list[tuple[int, str]]]:
+    indexed = list(enumerate(values))
+    return [indexed[index : index + size] for index in range(0, len(indexed), size)]
 
+
+def fetch_patents(
+    document_numbers: list[str],
+    detail_groups: set[str] | None = None,
+    max_workers: int = DEFAULT_WORKERS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+) -> dict:
+    """Fetch patent records concurrently while preserving the requested order."""
     numbers = [number for number in document_numbers if number.strip()]
     groups = set(detail_groups or set()) & DETAIL_GROUPS
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; CorporateTools/1.0)"})
+    if not numbers:
+        return {"tool": "Patent Intelligence", "result_count": 0, "detail_groups_fetched": sorted(groups), "patents": []}
+
+    worker_count = min(max(1, max_workers), MAX_WORKERS, len(numbers))
+    batch_count = max(1, batch_size)
     indexed_results: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(numbers)))) as executor:
-        futures = {executor.submit(_fetch_one, number, session, groups): index for index, number in enumerate(numbers)}
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                indexed_results[index] = future.result()
-            except Exception as exc:
-                indexed_results[index] = {"document_number": numbers[index], "availability": "Error", "error": str(exc)}
-    results = [indexed_results[index] for index in range(len(numbers))]
-    return {"tool": "Patent Intelligence", "result_count": len(results), "detail_groups_fetched": sorted(groups), "patents": results}
+    completed = 0
+
+    cancelled = False
+    for batch in _chunks(numbers, batch_count):
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            break
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(batch))) as executor:
+            futures = {executor.submit(_fetch_one, number, groups): index for index, number in batch}
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = futures[future]
+                    try:
+                        indexed_results[index] = future.result()
+                    except Exception as exc:
+                        indexed_results[index] = {"document_number": numbers[index], "availability": "Error", "error": str(exc)}
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed, len(numbers), indexed_results[index])
+                if cancel_event and cancel_event.is_set():
+                    cancelled = True
+                    for future in pending:
+                        future.cancel()
+                    break
+            if cancelled:
+                break
+
+    results = [indexed_results[index] for index in range(len(numbers)) if index in indexed_results]
+    return {
+        "tool": "Patent Intelligence",
+        "result_count": len(results),
+        "requested_count": len(numbers),
+        "cancelled": cancelled,
+        "detail_groups_fetched": sorted(groups),
+        "workers_used": worker_count,
+        "batch_size": batch_count,
+        "patents": results,
+    }

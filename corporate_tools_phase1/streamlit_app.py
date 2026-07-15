@@ -5,8 +5,10 @@ from __future__ import annotations
 import io
 import html
 import json
+import threading
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -358,6 +360,151 @@ def table_downloads(records: list[dict], basename: str, link_columns: dict[str, 
     json_col.download_button("Download JSON", frame.to_json(orient="records", indent=2), f"{basename}.json", "application/json", use_container_width=True)
 
 
+def patent_summary_records(patents: list[dict]) -> list[dict]:
+    records = []
+    for patent in patents:
+        records.append({
+            "document_number": patent.get("document_number", ""),
+            "document_number_used": patent.get("document_number_used", ""),
+            "availability": patent.get("availability", ""),
+            "title": patent.get("title", ""),
+            "inventors": "; ".join(patent.get("inventors", [])),
+            "inventors_translated": "; ".join(patent.get("inventors_translated", [])),
+            "original_assignees": "; ".join(patent.get("assignees_original", [])),
+            "current_assignees": "; ".join(patent.get("assignees_current", [])),
+            "translated_assignees": "; ".join(patent.get("assignees_translated", [])),
+            "legal_status": patent.get("legal_status", ""),
+            "application_number": patent.get("application_number", ""),
+            "priority_date": patent.get("priority_date", ""),
+            "filing_date": patent.get("filing_date", ""),
+            "publication_date": patent.get("publication_date", ""),
+            "grant_date": patent.get("grant_date", ""),
+            "adjusted_expiration": patent.get("adjusted_expiration", ""),
+            "anticipated_expiration": patent.get("anticipated_expiration", ""),
+            "claim_count": patent.get("claim_count", ""),
+            "classification_count": len(patent.get("classifications", [])),
+            "family_application_count": len(patent.get("family_applications", [])),
+            "patent_citation_count": len(patent.get("patent_citations", [])),
+            "cited_by_count": len(patent.get("cited_by", [])),
+            "legal_event_count": len(patent.get("legal_events", [])),
+            "pdf": patent.get("pdf", ""),
+            "google_patents_url": patent.get("google_patents_url", ""),
+        })
+    return records
+
+
+def patent_job_payload(job: dict) -> dict:
+    with job["lock"]:
+        return {
+            "tool": "Patent Intelligence",
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "cancelled": job["status"] == "cancelled",
+            "requested_count": job["total"],
+            "result_count": len(job["results"]),
+            "detail_groups_fetched": sorted(job["detail_groups"]),
+            "workers_used": job["workers"],
+            "batch_size": job["batch_size"],
+            "checkpoint_path": str(job["checkpoint_path"]),
+            "patents": list(job["results"]),
+            "error": job.get("error", ""),
+        }
+
+
+def save_patent_checkpoint(job: dict) -> None:
+    payload = patent_job_payload(job)
+    path = Path(payload["checkpoint_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def start_patent_job(numbers: list[str], detail_groups: set[str], workers: int, batch_size: int) -> dict:
+    job_id = time.strftime("%Y%m%d-%H%M%S")
+    job = {
+        "job_id": job_id,
+        "total": len(numbers),
+        "completed": 0,
+        "results": [],
+        "latest": {},
+        "detail_groups": set(detail_groups),
+        "workers": workers,
+        "batch_size": batch_size,
+        "status": "running",
+        "error": "",
+        "lock": threading.Lock(),
+        "cancel_event": threading.Event(),
+        "checkpoint_path": ROOT / "exports" / "patent_runs" / f"patent_intelligence_{job_id}.json",
+    }
+
+    def update_progress(done: int, total: int, patent: dict) -> None:
+        with job["lock"]:
+            job["completed"] = done
+            job["latest"] = patent
+            job["results"].append(patent)
+        save_patent_checkpoint(job)
+
+    def run_job() -> None:
+        try:
+            result = fetch_patents(
+                numbers,
+                detail_groups,
+                max_workers=workers,
+                batch_size=batch_size,
+                progress_callback=update_progress,
+                cancel_event=job["cancel_event"],
+            )
+            with job["lock"]:
+                job["status"] = "cancelled" if result.get("cancelled") else "complete"
+        except Exception as exc:
+            with job["lock"]:
+                job["status"] = "error"
+                job["error"] = str(exc)
+        finally:
+            save_patent_checkpoint(job)
+
+    thread = threading.Thread(target=run_job, name=f"patent-fetch-{job_id}", daemon=True)
+    job["thread"] = thread
+    thread.start()
+    return job
+
+
+def render_patent_results(result: dict) -> None:
+    patents = result.get("patents", [])
+    if not patents:
+        st.info("No patent records have been saved yet.")
+        return
+
+    summary_tab, details_tab = st.tabs(["Patent summary & exports", "Selected details"])
+    with summary_tab:
+        table_downloads(
+            patent_summary_records(patents),
+            "patent_intelligence",
+            {"pdf": "Patent PDF", "google_patents_url": "Google Patents"},
+        )
+        st.download_button(
+            "Download complete JSON",
+            json.dumps(result, indent=2),
+            "patent_intelligence_complete.json",
+            "application/json",
+        )
+        if result.get("checkpoint_path"):
+            st.caption(f"Autosaved checkpoint: {result['checkpoint_path']}")
+    with details_tab:
+        st.caption(f"Fetched optional groups: {', '.join(result.get('detail_groups_fetched', [])) or 'none (Quick mode)'}")
+        for patent in patents:
+            label = f"{patent.get('document_number', 'Patent')} - {patent.get('legal_status') or patent.get('availability', '')}"
+            with st.expander(label):
+                if patent.get("abstract"):
+                    st.markdown("#### Abstract")
+                    st.write(patent["abstract"])
+                events = patent.get("legal_events", [])
+                if events:
+                    st.markdown("#### Legal-event history")
+                    st.dataframe(events, use_container_width=True, hide_index=True)
+                st.markdown("#### Complete record")
+                st.json(patent, expanded=False)
+
+
 def text_tool(name: str) -> None:
     _, _, runner = TEXT_TOOLS[name]
     sample = st.text_area("Business input", height=280, placeholder="Paste source text, notes, requirements, or document content here...")
@@ -696,22 +843,76 @@ def research_tool(name: str) -> None:
             "Similar and related documents": "related",
             "Full description and drawing links": "full_text_media",
         }
-        standard_groups = {"translations", "legal", "classifications", "family", "citations"}
+        standard_groups = {"legal", "classifications", "family", "citations"}
         if fetch_depth == "Quick":
             detail_groups = set()
             st.caption("Fastest: title, abstract, inventors, assignees, status, dates, expiration and links.")
         elif fetch_depth == "Standard":
             detail_groups = standard_groups
-            st.caption("Recommended: core profile plus translations, legal history, classifications, family and citations.")
+            st.caption("Recommended for batches: core profile plus legal history, classifications, family and citations. Use Custom for translations.")
         elif fetch_depth == "Complete":
             detail_groups = set(group_labels.values())
             st.caption("Everything available, including claims, full description and drawing links.")
         else:
             chosen_groups = st.multiselect("Choose optional detail groups", list(group_labels), default=["Legal events, assignments and litigation"])
             detail_groups = {group_labels[label] for label in chosen_groups}
-        if st.button("Fetch patents", type="primary", disabled=not numbers):
-            with st.spinner(f"Collecting {fetch_depth.lower()} patent data..."):
-                result = fetch_patents(numbers, detail_groups)
+        queue_size = st.slider(
+            "Parallel queues",
+            min_value=1,
+            max_value=12,
+            value=min(4, max(1, len(numbers))),
+            help="Higher values process more patent numbers at the same time. Reduce this if Google Patents starts timing out.",
+        )
+        batch_size = st.number_input(
+            "Rows queued per batch",
+            min_value=10,
+            max_value=1000,
+            value=100,
+            step=10,
+            help="The app saves after each completed row and only queues this many rows at once, so cancellation can stop after the active batch.",
+        )
+        job = st.session_state.get("patent_job")
+        running = bool(job and job.get("thread") and job["thread"].is_alive())
+        start_col, cancel_col, clear_col = st.columns(3)
+        if start_col.button("Fetch patents", type="primary", disabled=not numbers or running, use_container_width=True):
+            st.session_state["patent_job"] = start_patent_job(numbers, detail_groups, int(queue_size), int(batch_size))
+            st.rerun()
+
+        if running and cancel_col.button("Cancel process", use_container_width=True):
+            job["cancel_event"].set()
+            with job["lock"]:
+                job["status"] = "cancelling"
+            save_patent_checkpoint(job)
+            st.rerun()
+
+        if job and not running and clear_col.button("Clear saved run", use_container_width=True):
+            st.session_state.pop("patent_job", None)
+            st.rerun()
+
+        job = st.session_state.get("patent_job")
+        if job:
+            result = patent_job_payload(job)
+            completed = result["result_count"]
+            total = max(result["requested_count"], 1)
+            latest = job.get("latest", {})
+            status = result["status"]
+            status_label = "Cancellation requested" if status == "cancelling" else status.title()
+            st.progress(completed / total, text=f"{status_label}: processed {completed}/{result['requested_count']} patents")
+            if latest:
+                st.caption(f"Latest saved: {latest.get('document_number', 'patent')} - {latest.get('availability', 'Processed')}")
+            if result.get("error"):
+                st.error(result["error"])
+            if job.get("thread") and job["thread"].is_alive():
+                st.caption(f"Autosaved checkpoint: {result['checkpoint_path']}")
+                if result["patents"]:
+                    st.download_button(
+                        "Download saved partial JSON",
+                        json.dumps(result, indent=2),
+                        "patent_intelligence_partial.json",
+                        "application/json",
+                    )
+                time.sleep(1)
+                st.rerun()
             patents = result["patents"]
             summary_records = []
             for patent in patents:
@@ -764,6 +965,9 @@ def research_tool(name: str) -> None:
                             st.dataframe(events, use_container_width=True, hide_index=True)
                         st.markdown("#### Complete record")
                         st.json(patent, expanded=False)
+            if job.get("thread") and job["thread"].is_alive():
+                time.sleep(1)
+                st.rerun()
 
 
 def spreadsheet_discovery_tool(name: str) -> None:
