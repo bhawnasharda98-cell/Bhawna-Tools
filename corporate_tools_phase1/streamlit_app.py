@@ -48,7 +48,7 @@ from invoice_to_accounting import accounting_entries
 from knowledge_assistant import answer_question, build_index
 from meeting_notes_generator import generate_notes
 from news_search import search_news
-from patent_intelligence import fetch_patents
+from patent_intelligence import DEFAULT_BATCH_SIZE, DEFAULT_WORKERS, fetch_patents
 from pdf_suite import compress, extract_text, merge, rotate, split
 from policy_impact_analyzer import policy_impact
 from process_recorder import process_document
@@ -856,26 +856,11 @@ def research_tool(name: str) -> None:
         else:
             chosen_groups = st.multiselect("Choose optional detail groups", list(group_labels), default=["Legal events, assignments and litigation"])
             detail_groups = {group_labels[label] for label in chosen_groups}
-        queue_size = st.slider(
-            "Parallel queues",
-            min_value=1,
-            max_value=12,
-            value=min(4, max(1, len(numbers))),
-            help="Higher values process more patent numbers at the same time. Reduce this if Google Patents starts timing out.",
-        )
-        batch_size = st.number_input(
-            "Rows queued per batch",
-            min_value=10,
-            max_value=1000,
-            value=100,
-            step=10,
-            help="The app saves after each completed row and only queues this many rows at once, so cancellation can stop after the active batch.",
-        )
         job = st.session_state.get("patent_job")
         running = bool(job and job.get("thread") and job["thread"].is_alive())
         start_col, cancel_col, clear_col = st.columns(3)
         if start_col.button("Fetch patents", type="primary", disabled=not numbers or running, use_container_width=True):
-            st.session_state["patent_job"] = start_patent_job(numbers, detail_groups, int(queue_size), int(batch_size))
+            st.session_state["patent_job"] = start_patent_job(numbers, detail_groups, DEFAULT_WORKERS, DEFAULT_BATCH_SIZE)
             st.rerun()
 
         if running and cancel_col.button("Cancel process", use_container_width=True):
@@ -910,7 +895,7 @@ def research_tool(name: str) -> None:
                         json.dumps(result, indent=2),
                         "patent_intelligence_partial.json",
                         "application/json",
-                )
+                    )
                 time.sleep(1)
                 st.rerun()
             render_patent_results(result)
