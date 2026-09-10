@@ -531,6 +531,15 @@ def csv_tools(name: str) -> None:
 
 def excel_tools(name: str) -> None:
     upload = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+    rows_per_file = None
+    if name == "Excel Splitter":
+        rows_per_file = st.number_input(
+            "Rows per split file",
+            min_value=1,
+            value=500,
+            step=50,
+            help="Each output file keeps the header row, then includes up to this many data rows.",
+        )
     if upload and st.button("Analyze workbook" if name != "Excel Splitter" else "Split workbook", type="primary"):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -540,12 +549,12 @@ def excel_tools(name: str) -> None:
             elif name == "Excel-to-System":
                 render_result(plan_system(source))
             else:
-                outputs = split_excel(source, folder / "sheets")
+                outputs = split_excel(source, folder / "sheets", int(rows_per_file) if rows_per_file else None)
                 bundle = io.BytesIO()
                 with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
                     for output in outputs:
                         archive.write(output, output.name)
-                st.success(f"Created {len(outputs)} worksheet files.")
+                st.success(f"Created {len(outputs)} split files.")
                 st.download_button("Download worksheet ZIP", bundle.getvalue(), "split_workbook.zip", "application/zip")
 
 

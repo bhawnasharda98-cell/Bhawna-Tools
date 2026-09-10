@@ -49,7 +49,7 @@ locally. These services were adapted from the user's
 
 | Tool | Script | Example |
 | --- | --- | --- |
-| Excel Splitter | `excel_splitter.py` | `python excel_splitter.py workbook.xlsx --output-dir split_excel` |
+| Excel Splitter | `excel_splitter.py` | `python excel_splitter.py workbook.xlsx --output-dir split_excel --rows-per-file 500` |
 | PDF Merger | `pdf_merger.py` | `python pdf_merger.py a.pdf b.pdf --output merged.pdf` |
 | PDF Compressor | `pdf_compressor.py` | `python pdf_compressor.py input.pdf --output compressed.pdf` |
 | CSV Cleaner | `csv_cleaner.py` | `python csv_cleaner.py dirty.csv --output clean.csv --dedupe` |
